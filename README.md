@@ -22,6 +22,7 @@ Open-source Python driver and interactive keyboard controller for the **LEGO® T
 - **`movehub.py`** — async driver library: scan → connect → pair, VM handshake, steering calibration, continuous 20 Hz drive stream, direct motor power, status LED, battery voltage, accelerometer, safe session end
 - **`controller.py`** — interactive terminal controller (AUTO drive mode + ROBOT motor mode, telemetry, watchdog, script mode)
 - **`demo.py`** — end-to-end demo drive
+- **`android/`** — **Move Hub Remote**, a native Android app (pure SDK, Java, no external libraries): scan & bond, AUTO drive mode (D-pad speed/steering/lights/brake), ROBOT mode (three direct-motor sliders), battery voltage, steering calibration, clean session end on backgrounding
 - **`docs/protocol.md`** — reverse-engineered protocol notes: port map, frames, flags, crash map
 - **`probes/`** — the 15 probe scripts that mapped the protocol, with their JSON session logs
 
@@ -142,6 +143,26 @@ API summary:
 - `probe_v15.py` — bond-removal / re-pair recovery + a full 20 Hz test drive
 
 Run one with `MOVEHUB_ADDR` set (or empty for name discovery) — but read [`docs/protocol.md`](docs/protocol.md) §6 first: some probes intentionally trigger the crash modes and need a power cycle afterwards.
+
+## Android app
+
+`android/` contains a native Android remote — verified on a real tablet (Android 16, Honor NDL-W09) driving the real hub. Pure Android SDK (Java, minSdk 23, no external dependencies), BLE over the system stack, and the same LWP3 frames as the Python driver:
+
+- **CONNECT** — scans for the hub (by BLE name or LEGO manufacturer ID 919), connects, bonds (Just Works), runs the VM handshake and steering calibration, then streams drive frames at 20 Hz
+- **AUTO mode** — big D-pad buttons: ▲10 / ▼10 speed, ◀ / ▶ steering, STOP, LIGHTS on/off, BRAKE
+- **ROBOT mode** — three sliders for direct motor power A/B/C (−100..+100) + STOP ALL, for custom builds
+- **V** — one-shot battery voltage · **CAL** — re-run steering calibration
+- backgrounding the app always ends the session cleanly (lights off + `HUB_ACTION_DISCONNECT`), so the hub never ends up in the ERR 0x05 session-lock
+
+Build & install:
+
+```bash
+cd android
+./gradlew assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
+
+Requires Android Studio's SDK (the build picks it up from `local.properties`, which is not committed — create it with `sdk.dir=/path/to/android-sdk`). First connect needs the tablet's Bluetooth on; the app asks for the BLUETOOTH_SCAN / BLUETOOTH_CONNECT permissions (Android 12+) itself.
 
 ## Sources & credits
 
