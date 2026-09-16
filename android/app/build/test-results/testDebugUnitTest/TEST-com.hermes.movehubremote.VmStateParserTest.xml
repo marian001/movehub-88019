@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.hermes.movehubremote.VmStateParserTest" tests="6" skipped="0" failures="0" errors="0" timestamp="2026-09-16T20:47:04" hostname="dell" time="0.003">
+  <properties/>
+  <testcase name="executingStateIsRecognizedWithoutRestart" classname="com.hermes.movehubremote.VmStateParserTest" time="0.002"/>
+  <testcase name="stoppedStateIsRecognizedAndRequiresRestart" classname="com.hermes.movehubremote.VmStateParserTest" time="0.0"/>
+  <testcase name="runningStateIsRecognizedWithoutRestart" classname="com.hermes.movehubremote.VmStateParserTest" time="0.0"/>
+  <testcase name="unknownStateIsRejected" classname="com.hermes.movehubremote.VmStateParserTest" time="0.001"/>
+  <testcase name="portFeedbackParsingCoversInProgressStatus" classname="com.hermes.movehubremote.VmStateParserTest" time="0.0"/>
+  <testcase name="shortOrWrongFramesAreRejected" classname="com.hermes.movehubremote.VmStateParserTest" time="0.0"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

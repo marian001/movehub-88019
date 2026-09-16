@@ -1,0 +1,7 @@
+com.hermes.movehubremote.app-pngs-0 /home/alfonz/repos/movehub-88019/android/app/build/generated/res/pngs/debug
+com.hermes.movehubremote.app-resValues-1 /home/alfonz/repos/movehub-88019/android/app/build/generated/res/resValues/debug
+com.hermes.movehubremote.app-packageDebugResources-2 /home/alfonz/repos/movehub-88019/android/app/build/intermediates/incremental/debug/packageDebugResources/merged.dir
+com.hermes.movehubremote.app-packageDebugResources-3 /home/alfonz/repos/movehub-88019/android/app/build/intermediates/incremental/debug/packageDebugResources/stripped.dir
+com.hermes.movehubremote.app-merged_res-4 /home/alfonz/repos/movehub-88019/android/app/build/intermediates/merged_res/debug
+com.hermes.movehubremote.app-debug-5 /home/alfonz/repos/movehub-88019/android/app/src/debug/res
+com.hermes.movehubremote.app-main-6 /home/alfonz/repos/movehub-88019/android/app/src/main/res

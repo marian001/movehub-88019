@@ -1,0 +1,3 @@
+com.hermes.movehubremote:layout/activity_main = 0x7f020000
+com.hermes.movehubremote:id/emergency = 0x7f010001
+com.hermes.movehubremote:id/cards = 0x7f010000

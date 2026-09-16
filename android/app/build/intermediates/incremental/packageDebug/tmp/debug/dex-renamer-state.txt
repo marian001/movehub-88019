@@ -1,0 +1,7 @@
+#Wed Sep 16 22:47:05 CEST 2026
+base.0=/home/alfonz/repos/movehub-88019/android/app/build/intermediates/dex/debug/mergeProjectDexDebug/0/classes.dex
+base.1=/home/alfonz/repos/movehub-88019/android/app/build/intermediates/dex/debug/mergeProjectDexDebug/6/classes.dex
+path.0=0/classes.dex
+path.1=6/classes.dex
+renamed.0=classes.dex
+renamed.1=classes2.dex

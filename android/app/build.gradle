@@ -10,8 +10,8 @@ android {
         applicationId "com.hermes.movehubremote"
         minSdk 23
         targetSdk 34
-        versionCode 1
-        versionName "1.0"
+        versionCode 4
+        versionName "0.2"
     }
 
     buildTypes {
@@ -29,3 +29,5 @@ android {
 dependencies {
     // none — pure Android SDK, no external libraries
 }
+
+dependencies { testImplementation 'junit:junit:4.13.2' }

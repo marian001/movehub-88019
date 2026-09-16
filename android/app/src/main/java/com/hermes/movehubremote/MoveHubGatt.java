@@ -1,511 +1,417 @@
 package com.hermes.movehubremote;
 
 import android.annotation.SuppressLint;
-import android.bluetooth.BluetoothAdapter;
-import android.bluetooth.BluetoothDevice;
-import android.bluetooth.BluetoothGatt;
-import android.bluetooth.BluetoothGattCallback;
-import android.bluetooth.BluetoothGattCharacteristic;
-import android.bluetooth.BluetoothGattDescriptor;
-import android.bluetooth.BluetoothManager;
-import android.bluetooth.BluetoothProfile;
-import android.bluetooth.le.ScanCallback;
-import android.bluetooth.le.ScanResult;
-import android.bluetooth.le.ScanSettings;
-import android.content.BroadcastReceiver;
-import android.content.Context;
-import android.content.Intent;
-import android.content.IntentFilter;
-import android.os.Build;
-import android.os.Handler;
-import android.os.Looper;
+import android.bluetooth.*;
+import android.bluetooth.le.*;
+import android.content.*;
+import android.os.*;
 import android.util.Log;
-
-import java.util.ArrayDeque;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.UUID;
 
-/**
- * BLE + LWP3 driver for the LEGO Technic Move Hub 88019 (set 42176).
- * Java port of the verified Python driver (github.com/marian001/movehub-88019).
- *
- * Critical rules baked in:
- *  - bond (createBond) after connecting, before use
- *  - VM handshake (subscribe -> state -> ARM) before any drive frame
- *  - drive frames as a continuous 20 Hz stream (keepalive)
- *  - ALWAYS end the session with HUB_ACTION_DISCONNECT before BLE disconnect,
- *    otherwise the hub's drive VM refuses all drive frames (ERR 0x05) in the
- *    next session — a state that survives power-cycles.
+/** One strictly addressed session, queue, callbacks and 20 Hz stream per hub.
+ * All mutable state is confined to the main looper. Never share a GATT queue.
  */
-public class MoveHubGatt {
-
+@SuppressLint("MissingPermission")
+public final class MoveHubGatt {
     private static final String TAG = "MoveHubGatt";
-
-    private static final UUID SVC =
-            UUID.fromString("00001623-1212-efde-1623-785feabcd123");
-    private static final UUID CHR =
-            UUID.fromString("00001624-1212-efde-1623-785feabcd123");
-    private static final UUID CCC =
-            UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
-
-    public static final int MOTOR_A = 0x32, MOTOR_B = 0x33, MOTOR_C = 0x34;
-    public static final int BRAKE = 0x7F, FLOAT = 0x00;
-
+    private static final UUID SVC = UUID.fromString("00001623-1212-efde-1623-785feabcd123");
+    private static final UUID CHR = UUID.fromString("00001624-1212-efde-1623-785feabcd123");
+    private static final UUID CCC = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
+    public static final int MOTOR_A = 0x32, MOTOR_B = 0x33, MOTOR_C = 0x34, BRAKE = 127;
     public interface Listener {
-        void onStatus(String text);      // free-form status line
-        void onReady();                  // connected + handshake + calibrated
+        void onStatus(String text);
+        void onReady();
         void onDisconnected();
         void onVoltage(int mv);
     }
-
     private final Context ctx;
+    private final ControlRouter.Hub hub;
+    private final ControlRouter.State state;
     private final Listener listener;
     private final Handler main = new Handler(Looper.getMainLooper());
-
-    private BluetoothAdapter adapter;
+    private final SessionQueue queue = new SessionQueue();
+    private final BluetoothAdapter adapter;
     private BluetoothGatt gatt;
     private BluetoothGattCharacteristic characteristic;
-    private boolean closing = false;
-    private boolean closed = true;
+    private ScanCallback scanner;
+    private boolean closed = true, closing, scanning, streaming, descriptorBusy;
+    private boolean receiverRegistered, subscribed, vmSeen, vmStopped, armAck, armSent, voltagePending;
+    private boolean lights = true, robot, endWritten, tickDead, retryOnce;
+    private int generation, phase, writeSerial;
+    private Runnable writeTimeout;
+    private static String hex(byte[] f) { StringBuilder s = new StringBuilder(); for (byte b : f) s.append(String.format("%02x", b)); return s.toString(); }
 
-    // write queue (one write at a time, NO_RESPONSE)
-    private final ArrayDeque<byte[]> queue = new ArrayDeque<>();
-    private boolean writeBusy = false;
-
-    // drive state (streamed at 20 Hz)
-    private volatile int speed = 0, steer = 0, flags = 0x00;
-    private Runnable streamTick;
-    private volatile boolean streaming = false;
-
-    // ------------------------------------------------------------------ scan
-
-    private final ScanCallback scanCb = new ScanCallback() {
-        @Override
-        public void onScanResult(int callbackType, ScanResult result) {
-            String name = result.getScanRecord() != null
-                    ? result.getScanRecord().getDeviceName() : null;
-            boolean byName = name != null && name.contains("Technic Move");
-            boolean byMfg = result.getScanRecord() != null
-                    && result.getScanRecord().getManufacturerSpecificData(0x0397) != null;
-            if (byName || byMfg) {
-                stopScan();
-                listener.onStatus("found " + (name != null ? name : result.getDevice().getAddress())
-                        + " — connecting...");
-                connect(result.getDevice());
-            }
-        }
-
-        @Override
-        public void onScanFailed(int errorCode) {
-            listener.onStatus("scan failed (" + errorCode + ")");
-        }
-    };
-
-    private boolean scanning = false;
-
-    public MoveHubGatt(Context ctx, Listener listener) {
-        this.ctx = ctx.getApplicationContext();
-        this.listener = listener;
-        BluetoothManager bm = (BluetoothManager) this.ctx.getSystemService(Context.BLUETOOTH_SERVICE);
-        adapter = bm != null ? bm.getAdapter() : null;
+    public MoveHubGatt(Context context, ControlRouter.Hub hub, ControlRouter.State state, Listener listener) {
+        ctx = context.getApplicationContext(); this.hub = hub; this.state = state; this.listener = listener;
+        BluetoothManager manager = (BluetoothManager) ctx.getSystemService(Context.BLUETOOTH_SERVICE);
+        adapter = manager == null ? null : manager.getAdapter();
     }
+    private void status(String text) { Log.i(TAG, hub.label + ": " + text); listener.onStatus(text); }
+    private void later(long delay, Runnable action) {
+        final int session = generation, step = phase;
+        main.postDelayed(() -> {
+            if (!closed && !closing && session == generation && step == phase) action.run();
+        }, delay);
+    }
+    public boolean isClosed() { return closed; }
+    public boolean isReady() { return state.ready && !closing; }
+    public boolean isClosing() { return closing; }
 
-    /** Start scanning for the hub and auto-connect. */
-    @SuppressLint("MissingPermission")
     public void scanAndConnect() {
-        if (adapter == null) {
-            listener.onStatus("no Bluetooth adapter");
-            return;
-        }
-        if (!adapter.isEnabled()) {
-            listener.onStatus("Bluetooth is off — enable it first");
-            return;
-        }
-        closing = false;
-        ScanSettings settings = new ScanSettings.Builder()
-                .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-                .build();
-        scanning = true;
-        // unfiltered scan; we match by name or LEGO manufacturer id (919) in the callback
-        adapter.getBluetoothLeScanner().startScan(null, settings, scanCb);
-        listener.onStatus("scanning — press the green button on the hub...");
-    }
-
-    @SuppressLint("MissingPermission")
-    private void stopScan() {
-        if (scanning && adapter != null && adapter.getBluetoothLeScanner() != null) {
-            try {
-                adapter.getBluetoothLeScanner().stopScan(scanCb);
-            } catch (Exception ignored) {
-            }
-        }
-        scanning = false;
-    }
-
-    // --------------------------------------------------------------- connect
-
-    @SuppressLint("MissingPermission")
-    private void connect(BluetoothDevice device) {
-        closed = false;
-        gatt = device.connectGatt(ctx, false, gattCb, BluetoothDevice.TRANSPORT_LE);
-    }
-
-    private final BroadcastReceiver bondReceiver = new BroadcastReceiver() {
-        @Override
-        public void onReceive(Context context, Intent intent) {
-            if (BluetoothDevice.ACTION_BOND_STATE_CHANGED.equals(intent.getAction())) {
-                int state = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, -1);
-                int prev = intent.getIntExtra(BluetoothDevice.EXTRA_PREVIOUS_BOND_STATE, -1);
-                BluetoothDevice dev = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
-                if (dev == null || gatt == null || dev.getAddress() == null
-                        || !dev.getAddress().equals(gatt.getDevice().getAddress())) return;
-                if (state == BluetoothDevice.BOND_BONDED) {
-                    listener.onStatus("bonded — subscribing...");
-                    main.post(() -> enableNotifications());
-                } else if (state == BluetoothDevice.BOND_NONE && prev != BluetoothDevice.BOND_NONE) {
-                    listener.onStatus("bonding failed — trying to continue anyway...");
-                    main.post(() -> enableNotifications());
-                }
-            }
-        }
-    };
-
-    private final BluetoothGattCallback gattCb = new BluetoothGattCallback() {
-
-        @Override
-        public void onConnectionStateChange(BluetoothGatt g, int status, int newState) {
-            main.post(() -> {
-                if (newState == BluetoothProfile.STATE_CONNECTED) {
-                    listener.onStatus("connected — discovering services...");
-                    gatt.discoverServices();
-                } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                    if (closing) {
-                        closeGattNow();
-                    } else {
-                        cleanup();
-                        listener.onStatus("disconnected");
-                        listener.onDisconnected();
-                    }
-                }
-            });
-        }
-
-        @Override
-        public void onServicesDiscovered(BluetoothGatt g, int status) {
-            main.post(() -> {
-                if (status != BluetoothGatt.GATT_SUCCESS || gatt == null) {
-                    listener.onStatus("service discovery failed");
-                    return;
-                }
-                characteristic = gatt.getService(SVC) != null
-                        ? gatt.getService(SVC).getCharacteristic(CHR) : null;
-                if (characteristic == null) {
-                    listener.onStatus("LWP3 service not found — wrong device?");
-                    safeClose();
-                    return;
-                }
-                int bond = gatt.getDevice().getBondState();
-                if (bond != BluetoothDevice.BOND_BONDED) {
-                    listener.onStatus("bonding (Just Works)...");
-                    IntentFilter f = new IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED);
-                    if (Build.VERSION.SDK_INT >= 33) {
-                        ctx.registerReceiver(bondReceiver, f, Context.RECEIVER_EXPORTED);
-                    } else {
-                        ctx.registerReceiver(bondReceiver, f);
-                    }
-                    boolean ok = gatt.getDevice().createBond();
-                    if (!ok) {
-                        listener.onStatus("createBond() rejected — continuing unencrypted...");
-                        enableNotifications();
-                    }
-                    // bondReceiver path continues on success
-                    main.postDelayed(() -> {
-                        try {
-                            ctx.unregisterReceiver(bondReceiver);
-                        } catch (Exception ignored) {
-                        }
-                    }, 30000);
-                } else {
-                    listener.onStatus("already bonded — subscribing...");
-                    enableNotifications();
-                }
-            });
-        }
-
-        @Override
-        public void onDescriptorWrite(BluetoothGatt g, BluetoothGattDescriptor d, int status) {
-            main.post(() -> {
-                if (status == BluetoothGatt.GATT_SUCCESS) {
-                    listener.onStatus("notifications on — waiting for port map...");
-                    // let the port map arrive, then VM handshake
-                    main.postDelayed(() -> handshake(), 1200);
-                } else {
-                    listener.onStatus("descriptor write failed (" + status + ")");
-                }
-            });
-        }
-
-        @Override
-        public void onCharacteristicWrite(BluetoothGatt g,
-                                           BluetoothGattCharacteristic c, int status) {
-            main.post(() -> {
-                writeBusy = false;
-                pump();
-            });
-        }
-
-        @Override
-        public void onCharacteristicChanged(BluetoothGatt g,
-                                            BluetoothGattCharacteristic c) {
-            final byte[] data = c.getValue();
-            main.post(() -> handleNotify(data));
-        }
-
-        @Override
-        public void onCharacteristicChanged(BluetoothGatt g,
-                                            BluetoothGattCharacteristic c, byte[] data) {
-            // API 33+ overload — value arrives as a parameter
-            final byte[] d = data;
-            main.post(() -> handleNotify(d));
-        }
-    };
-
-    @SuppressLint("MissingPermission")
-    private void enableNotifications() {
-        if (gatt == null || characteristic == null) return;
-        gatt.setCharacteristicNotification(characteristic, true);
-        BluetoothGattDescriptor d = characteristic.getDescriptor(CCC);
-        if (d != null) {
-            d.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
-            gatt.writeDescriptor(d);
-        }
-    }
-
-    // ------------------------------------------------------------- handshake
-
-    private static final byte[] VM_SUBSCRIBE =
-            {0x0A, 0x00, 0x41, 0x36, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01};
-    private static final byte[] VM_STATE_REQ =
-            {0x05, 0x00, 0x21, 0x36, 0x00};
-    private static final byte[] VM_ARM =
-            {(byte) 0x09, 0x00, (byte) 0x81, 0x36, 0x11, 0x51, 0x00, 0x04, 0x01};
-    private static final byte[] HUB_ACTION_DISCONNECT =
-            {0x04, 0x00, 0x02, 0x02};
-
-    private void handshake() {
-        if (gatt == null) return;
-        listener.onStatus("VM handshake...");
-        enqueue(VM_SUBSCRIBE);
-        main.postDelayed(() -> { if (gatt != null) enqueue(VM_STATE_REQ); }, 400);
-        main.postDelayed(() -> { if (gatt != null) enqueue(VM_ARM); }, 1000);
-        // steering calibration (the steering MOVES — wheels must be free)
-        main.postDelayed(() -> { if (gatt != null) calibrateInternal(); }, 1600);
-    }
-
-    /** Steering calibration — sweeps the steering physically. */
-    private void calibrateInternal() {
-        listener.onStatus("calibrating steering (it sweeps!)...");
-        enqueue(driveFrame(0, 0, 0x10));   // INIT
-        main.postDelayed(() -> { if (gatt != null) enqueue(driveFrame(0, 0, 0x08)); }, 1600);  // CALIBRATE
-        main.postDelayed(() -> {
-            if (gatt != null) {
-                startStream();
-                listener.onStatus("ready");
-                listener.onReady();
-            }
-        }, 4200);
-    }
-
-    /** Public re-calibration (CAL button). */
-    public void calibrate() {
-        if (gatt == null) return;
-        calibrateInternal();
-    }
-
-    // ----------------------------------------------------------- drive stream
-
-    private static byte[] driveFrame(int speed, int steer, int flags) {
-        return new byte[]{0x0D, 0x00, (byte) 0x81, 0x36, 0x11, 0x51, 0x00, 0x03, 0x00,
-                (byte) (speed & 0xFF), (byte) (steer & 0xFF), (byte) (flags & 0xFF), 0x00};
-    }
-
-    private void startStream() {
-        if (streaming) return;
-        streaming = true;
-        streamTick = new Runnable() {
-            @Override
-            public void run() {
-                if (!streaming) return;
-                if (gatt != null && !writeBusy && queue.isEmpty()) {
-                    enqueue(driveFrame(speed, steer, flags));
-                }
-                main.postDelayed(this, 50);   // 20 Hz
-            }
-        };
-        main.post(streamTick);
-    }
-
-    private void stopStream() {
-        streaming = false;
-        if (streamTick != null) main.removeCallbacks(streamTick);
-    }
-
-    /**
-     * VM drive. speed -100..100, steer -70..70.
-     * lights=false -> flag 0x04 (lights off), brake -> flag 0x01.
-     */
-    public void setDrive(int speed, int steer, boolean lights, boolean brake) {
-        if (Math.abs(speed) > 100 || Math.abs(steer) > 70) return;
-        int f = (lights ? 0x00 : 0x04) | (brake ? 0x01 : 0x00);
-        this.speed = speed;
-        this.steer = steer;
-        this.flags = f;
-    }
-
-    public void setLights(boolean on) {
-        flags = (flags & ~0x04) | (on ? 0x00 : 0x04);
-    }
-
-    /** Direct motor power, -100..100; BRAKE (0x7F) or FLOAT (0) to stop. */
-    public void motorPower(int motor, int power) {
-        if (gatt == null) return;
-        enqueue(new byte[]{0x08, 0x00, (byte) 0x81, (byte) motor, 0x00, 0x51,
-                0x00, (byte) (power & 0xFF)});
-    }
-
-    private static final byte[] LED_COLORS = {
-            0x00, /* off */ 0x01 /* pink */, 0x02 /* purple */, 0x03 /* blue */,
-            0x04 /* lightblue */, 0x05 /* cyan */, 0x06 /* green */, 0x07 /* yellow */,
-            0x08 /* orange */, 0x09 /* red */, 0x0A /* white */
-    };
-
-    /** Status LED: 0=off, 3=blue, 5=cyan, 6=green, 8=orange, 9=red, 10=white... */
-    public void setLed(int colorIdx) {
-        if (gatt == null || colorIdx < 0 || colorIdx >= LED_COLORS.length) return;
-        enqueue(new byte[]{0x08, 0x00, (byte) 0x81, 0x3F, 0x11, 0x51, 0x00,
-                LED_COLORS[colorIdx]});
-    }
-
-    // --------------------------------------------------------------- voltage
-
-    /** One-shot battery read. Result via listener.onVoltage(mV). */
-    public void readVoltage() {
-        if (gatt == null) return;
-        // PortInputFormatSetup port 0x3C mode 0 delta 100 (0x64) notify on
-        enqueue(new byte[]{0x0A, 0x00, 0x41, 0x3C, 0x00, 0x64, 0x00, 0x00, 0x00, 0x01});
-        // auto-off after 2 s if nothing arrives
-        main.postDelayed(() -> {
-            if (gatt != null) enqueue(new byte[]
-                    {0x0A, 0x00, 0x41, 0x3C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00});
-        }, 2000);
-    }
-
-    private void handleNotify(byte[] b) {
-        if (b == null || b.length < 6) return;
-        if (b[2] == 0x45 && b[3] == 0x3C && b.length >= 6) {
-            int mv = ((b[4] & 0xFF) | ((b[5] & 0xFF) << 8));
-            listener.onVoltage(mv);
-            // disable notifications again (one-shot)
-            enqueue(new byte[]{0x0A, 0x00, 0x41, 0x3C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00});
-        }
-        // 0x45 0x36 = VM state/encoder streams; 05 00 05 81 xx = errors — ignored for now
-    }
-
-    // ------------------------------------------------------------ write queue
-
-    @SuppressLint("MissingPermission")
-    private void enqueue(byte[] frame) {
-        queue.add(frame);
-        pump();
-    }
-
-    @SuppressLint("MissingPermission")
-    private void pump() {
-        if (writeBusy || queue.isEmpty() || gatt == null || characteristic == null) return;
-        writeBusy = true;
-        byte[] f = queue.poll();
-        characteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE);
-        characteristic.setValue(f);
-        if (!gatt.writeCharacteristic(characteristic)) {
-            writeBusy = false;
-        }
-    }
-
-    // ------------------------------------------------------------------ close
-
-    /**
-     * ALWAYS call before dropping the connection. Sends lights-off +
-     * HUB_ACTION_DISCONNECT, then disconnects. Prevents the ERR 0x05
-     * session-lock on the next connection (a state that survives power
-     * cycles of the hub).
-     */
-    @SuppressLint("MissingPermission")
-    public void safeClose() {
-        stopScan();
-        stopStream();
-        queue.clear();
-        writeBusy = false;
-        if (gatt == null) {
-            closed = true;
-            return;
-        }
-        closing = true;
-        if (characteristic != null) {
-            // lights off, then HUB_ACTION_DISCONNECT, then BLE disconnect
-            characteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE);
-            characteristic.setValue(driveFrame(0, 0, 0x04));
-            gatt.writeCharacteristic(characteristic);
-        }
-        main.postDelayed(() -> {
-            if (gatt != null && characteristic != null) {
-                characteristic.setValue(HUB_ACTION_DISCONNECT);
-                gatt.writeCharacteristic(characteristic);
-            }
-        }, 300);
-        main.postDelayed(() -> {
-            if (gatt != null) {
-                try {
-                    gatt.disconnect();
-                } catch (Exception ignored) {
-                }
-            }
-        }, 900);
-        main.postDelayed(this::closeGattNow, 2500);
-    }
-
-    @SuppressLint("MissingPermission")
-    private void closeGattNow() {
-        if (gatt != null) {
-            try {
-                gatt.close();
-            } catch (Exception ignored) {
-            }
-            gatt = null;
-        }
-        characteristic = null;
-        closed = true;
+        if (!closed) return;
+        state.setReady(false);
         try {
-            ctx.unregisterReceiver(bondReceiver);
-        } catch (Exception ignored) {
+            if (adapter == null || !adapter.isEnabled() || adapter.getBluetoothLeScanner() == null) {
+                status("Bluetooth je vypnutý alebo nedostupný — zapnite ho v nastaveniach.");
+                listener.onDisconnected(); return;
+            }
+            generation++; phase++; closed = false; closing = false; scanning = true;
+            queue.reset(); robot = false; streaming = false; lights = true; retryOnce = false;
+            subscribed = vmSeen = vmStopped = armAck = armSent = endWritten = false;
+            final int session = generation;
+            scanner = new ScanCallback() {
+                @Override public void onScanResult(int type, ScanResult result) {
+                    main.post(() -> {
+                        if (session != generation || !scanning || closing || closed) return;
+                        if (!hub.matches(result.getDevice().getAddress())) return;
+                        stopScan();
+                        status("Nájdený presný hub — pripájam " + hub.address);
+                        try {
+                            gatt = result.getDevice().connectGatt(ctx, false, callbacks, BluetoothDevice.TRANSPORT_LE);
+                            if (gatt == null) fail("Android odmietol spojenie.");
+                            else {
+                                // Root cause 2026-09-16: the 45 s scan deadline kept running
+                                // through pair+handshake+calibration; a hub found late in the
+                                // window (green button pressed by hand) was killed mid-session
+                                // ~90 ms before Ready. Obsolete it and restart the clock from
+                                // the moment GATT is up: 30 s covers pair+CCC+handshake (~9 s).
+                                phase++;
+                                later(30000, () -> { if (!state.ready) fail("Čas pripojenia/párovania vypršal. Skúste znova; potvrďte párovanie v Androide."); });
+                            }
+                        } catch (RuntimeException e) { fail("Pripojenie: " + e.getMessage()); }
+                    });
+                }
+                @Override public void onScanFailed(int code) {
+                    main.post(() -> { if (session == generation && scanning) fail("Skenovanie zlyhalo: " + code); });
+                }
+            };
+            adapter.getBluetoothLeScanner().startScan(
+                Collections.singletonList(new ScanFilter.Builder().setDeviceAddress(hub.address).build()),
+                new ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build(), scanner);
+            status("Hľadám " + hub.address + " — stlačte zelené tlačidlo tohto hubu.");
+            later(45000, () -> { if (!state.ready) fail("Čas pripojenia/párovania vypršal. Skúste znova; potvrďte párovanie v Androide."); });
+        } catch (RuntimeException e) { fail("Bluetooth oprávnenia / skenovanie: " + e.getMessage()); }
+    }
+    private void stopScan() {
+        if (scanning && adapter != null && scanner != null) {
+            try { if (adapter.getBluetoothLeScanner() != null) adapter.getBluetoothLeScanner().stopScan(scanner); }
+            catch (RuntimeException ignored) { }
+        }
+        scanning = false; scanner = null;
+    }
+    private final BroadcastReceiver bondReceiver = new BroadcastReceiver() {
+        @Override public void onReceive(Context context, Intent intent) {
+            BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
+            if (device == null || !hub.matches(device.getAddress()) || closed || closing || gatt == null) return;
+            int bond = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, -1);
+            if (bond == BluetoothDevice.BOND_BONDED) enableNotifications();
+            else if (bond == BluetoothDevice.BOND_NONE) fail("Párovanie zlyhalo. Potvrďte systémovú výzvu a skúste znova.");
+        }
+    };
+    private final BluetoothGattCallback callbacks = new BluetoothGattCallback() {
+        @Override public void onConnectionStateChange(BluetoothGatt source, int result, int connectionState) {
+            main.post(() -> {
+                if (source != gatt || closed) return;
+                if (connectionState == BluetoothProfile.STATE_DISCONNECTED) {
+                    status(closing ? "Odpojený." : "Spojenie sa prerušilo — ovládanie vynulované.");
+                    closeNow(); return;
+                }
+                if (closing) return;
+                if (result != BluetoothGatt.GATT_SUCCESS) { fail("GATT spojenie: " + result); return; }
+                if (connectionState == BluetoothProfile.STATE_CONNECTED) {
+                    status("Pripojený — zisťujem služby...");
+                    try { if (!source.discoverServices()) fail("Zisťovanie služieb odmietnuté."); }
+                    catch (RuntimeException e) { fail("Služby: " + e.getMessage()); }
+                }
+            });
+        }
+        @Override public void onServicesDiscovered(BluetoothGatt source, int result) {
+            main.post(() -> {
+                if (source != gatt || closed || closing) return;
+                if (result != BluetoothGatt.GATT_SUCCESS) { fail("Zisťovanie služieb zlyhalo: " + result); return; }
+                BluetoothGattService service = source.getService(SVC);
+                characteristic = service == null ? null : service.getCharacteristic(CHR);
+                if (characteristic == null) { fail("Chýba služba LWP3."); return; }
+                try {
+                    if (source.getDevice().getBondState() == BluetoothDevice.BOND_BONDED) { enableNotifications(); return; }
+                    status("Párovanie — potvrďte systémovú výzvu Androidu.");
+                    IntentFilter filter = new IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED);
+                    if (Build.VERSION.SDK_INT >= 33) ctx.registerReceiver(bondReceiver, filter, Context.RECEIVER_EXPORTED);
+                    else ctx.registerReceiver(bondReceiver, filter);
+                    receiverRegistered = true;
+                    if (source.getDevice().getBondState() != BluetoothDevice.BOND_BONDING && !source.getDevice().createBond())
+                        fail("Android odmietol párovanie; nepokračujem bez šifrovania.");
+                } catch (RuntimeException e) { fail("Párovanie: " + e.getMessage()); }
+            });
+        }
+        @Override public void onDescriptorWrite(BluetoothGatt source, BluetoothGattDescriptor descriptor, int result) {
+            main.post(() -> {
+                if (source != gatt || closed || !descriptorBusy) return;
+                descriptorBusy = false;
+                if (closing) { pump(); return; }
+                if (result != BluetoothGatt.GATT_SUCCESS) { fail("Notifikácie zlyhali: " + result); return; }
+                status("Notifikácie zapnuté — čakám na hub...");
+                later(1200, MoveHubGatt.this::handshake);
+            });
+        }
+        @Override public void onCharacteristicWrite(BluetoothGatt source, BluetoothGattCharacteristic c, int result) {
+            main.post(() -> {
+                if (source != gatt || closed) return;
+                Log.i(TAG, hub.label + ": [DBG] write result=" + result + " serial=" + writeSerial);
+                if (writeTimeout != null) main.removeCallbacks(writeTimeout);
+                byte[] sent = queue.complete();
+                if (sent == null) return;
+                if (result != BluetoothGatt.GATT_SUCCESS) {
+                    if (!closing) { fail("GATT zápis zlyhal: " + result); return; }
+                    status("Chyba pri bezpečnom zatváraní: " + result);
+                }
+                if (Arrays.equals(sent, HubProtocol.END)) {
+                    endWritten = result == BluetoothGatt.GATT_SUCCESS;
+                    final BluetoothGatt ending = gatt;
+                    main.postDelayed(() -> { if (ending == gatt && closing) disconnectTransport(); }, 200);
+                } else pump();
+            });
+        }
+        @Override public void onCharacteristicChanged(BluetoothGatt source, BluetoothGattCharacteristic c) {
+            byte[] data = c.getValue();
+            if (data != null) notifyOnMain(source, data.clone());
+        }
+        @Override public void onCharacteristicChanged(BluetoothGatt source, BluetoothGattCharacteristic c, byte[] data) {
+            notifyOnMain(source, data.clone());
+        }
+    };
+    private void notifyOnMain(BluetoothGatt source, byte[] data) {
+        main.post(() -> { if (source == gatt && !closed && !closing) handleNotify(data); });
+    }
+    private void enableNotifications() {
+        if (subscribed || closed || closing || gatt == null || characteristic == null) return;
+        try {
+            if (gatt.getDevice().getBondState() != BluetoothDevice.BOND_BONDED) { fail("Spojenie nie je spárované."); return; }
+            BluetoothGattDescriptor descriptor = characteristic.getDescriptor(CCC);
+            if (descriptor == null || !gatt.setCharacteristicNotification(characteristic, true)) { fail("Chýba CCC / notifikácie odmietnuté."); return; }
+            subscribed = true; descriptorBusy = true;
+            descriptor.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
+            if (!gatt.writeDescriptor(descriptor)) { descriptorBusy = false; fail("CCC zápis odmietnutý."); }
+            later(6000, () -> { if (descriptorBusy) fail("CCC zápis bez odpovede."); });
+        } catch (RuntimeException e) { descriptorBusy = false; fail("Notifikácie: " + e.getMessage()); }
+    }
+    private void handshake() {
+        status("Inicializujem VM...");
+        enqueue(HubProtocol.SUBSCRIBE);
+        later(400, () -> enqueue(HubProtocol.STATE));
+        later(1100, () -> {
+            if (!vmSeen) { fail("Hub neposlal stav VM — nepovolím pohyb."); return; }
+            armSent = true;
+            if (vmStopped) {
+                // Root cause 2026-09-16 (Lambo motored dead): STOP+START+ARM sent
+                // back-to-back were all ACKed but the VM never left STOPPED (0x02)
+                // — "ACKs and does nothing". probe_v11's verified restart timing
+                // (STOP → 0.6 s → START → 1.0 s → ARM) actually restarts the VM.
+                enqueue(HubProtocol.VM_STOP);
+                later(600, () -> enqueue(HubProtocol.VM_START));
+                later(1600, () -> {
+                    enqueue(HubProtocol.ARM);
+                    later(700, () -> {
+                        if (!armAck) { fail("VM sa nespustil — skúste znova pripojiť."); return; }
+                        calibrateInternal();
+                    });
+                });
+            } else {
+                enqueue(HubProtocol.ARM);
+                later(700, () -> {
+                    if (!armAck) { fail("VM ARM bez potvrdenia — nepovolím kalibráciu."); return; }
+                    calibrateInternal();
+                });
+            }
+        });
+    }
+    private void calibrateInternal() {
+        stopStream(); state.setReady(false); queue.clearPending(); robot = false;
+        status("Kalibrácia: USB-C odpojené, kolesá vo vzduchu! Riadenie sa hýbe.");
+        enqueue(HubProtocol.drive(0, 0, 0x10));
+        later(1600, () -> enqueue(HubProtocol.drive(0, 0, 0x08)));
+        later(4200, () -> {
+            state.setReady(true); startStream(); setLed(hub.color);
+            status("Pripravený — držte ovládač; uvoľnenie zastaví."); listener.onReady();
+        });
+    }
+    public void calibrate() {
+        if (!isReady()) return;
+        emergencyStop(); phase++; calibrateInternal();
+    }
+    private final Runnable tick = new Runnable() {
+        @Override public void run() {
+            if (!streaming || !isReady() || robot) return;
+            if (queue.idle() && !descriptorBusy) {
+                enqueue(HubProtocol.drive(state.speed, state.steer, lights ? 0 : 4));
+                if (++tickCount % 10 == 1) Log.i(TAG, hub.label + ": stream tick " + tickCount + " speed=" + state.speed + " steer=" + state.steer + " q=" + queue.idle());
+                if (tickCount > 5 && state.speed == 0 && state.steer == 0) Log.i(TAG, hub.label + ": [DBG] zero-speed stream still running (tick " + tickCount + ")");
+            }
+            main.postDelayed(this, 50);
+        }
+    };
+    private int tickCount;
+    private void startStream() {
+        if (!isReady() || robot || streaming) return;
+        streaming = true; main.post(tick);
+    }
+    private void stopStream() { streaming = false; main.removeCallbacks(tick); }
+    public void setDrive(int speed, int steer, boolean lights, boolean brake) {
+        if (!isReady() || robot) return;
+        Log.i(TAG, hub.label + ": [DBG] setDrive speed=" + speed + " steer=" + steer + " brake=" + brake + " robot=" + robot);
+        this.lights = lights;
+        if (brake) { emergencyStop(); return; }
+        state.drive(speed, steer); startStream();
+    }
+    public void setLights(boolean on) {
+        lights = on;
+        // Lights are reachable ONLY through VM drive flags (port 0x35 rejects every
+        // write). AUTO applies them via the 20 Hz stream; ROBOT has no stream, so
+        // push a one-shot flags frame. It floats drive motors / centers the servo —
+        // callers re-apply direct motor power right after (MainActivity Panel).
+        if (!closed && !closing && robot && state.ready) enqueue(HubProtocol.drive(0, 0, on ? 0 : 4));
+    }
+    public void setRobot(boolean enabled) {
+        if (!isReady()) return;
+        emergencyStop(); robot = enabled;
+        if (robot) stopStream(); else { state.stop(); startStream(); }
+    }
+    public void motorPower(int motor, int power) {
+        if (!isReady() || !robot) return;
+        enqueue(HubProtocol.motor(motor, power));
+    }
+    public void setLed(int color) { if (!closed && !closing) enqueue(HubProtocol.led(color)); }
+    public void readVoltage() {
+        if (!isReady() || voltagePending) return;
+        voltagePending = true; enqueue(HubProtocol.voltage(true));
+        later(2000, () -> {
+            if (voltagePending) { voltagePending = false; enqueue(HubProtocol.voltage(false)); status("Napätie: bez odpovede hubu."); }
+        });
+    }
+    private void handleNotify(byte[] data) {
+        if (data.length < 5) return;
+        Log.i(TAG, hub.label + ": [DBG] notify " + hex(data) + " (vmSeen=" + vmSeen + " armAck=" + armAck + ")");
+        if (data[2] == 0x05) { fail("Hub hlási LWP3 chybu " + (data[4] & 255)); return; }
+        Integer feedback = HubProtocol.parsePortFeedback(data);
+        if (feedback != null && armSent && feedback == 1) armAck = true;
+        Integer vm = HubProtocol.parseVmState(data);
+        if (vm != null) {
+            vmSeen = true;
+            vmStopped = HubProtocol.VM_STOPPED.equals(vm);
+        }
+        if (data[2] == 0x45 && data[3] == 0x3c && data.length >= 6 && voltagePending) {
+            voltagePending = false;
+            listener.onVoltage((data[4] & 255) | ((data[5] & 255) << 8));
+            enqueue(HubProtocol.voltage(false));
         }
     }
-
-    private void cleanup() {
-        stopStream();
-        queue.clear();
-        writeBusy = false;
+    private void enqueue(byte[] frame) {
+        if (gatt == null || characteristic == null || closed) return;
+        queue.add(frame); pump();
     }
-
-    /** Pause the 20 Hz drive stream (e.g. while in ROBOT mode). */
-    public void pauseStream() {
-        stopStream();
+    private void pump() {
+        if (closed || gatt == null || characteristic == null || descriptorBusy) return;
+        byte[] frame = queue.take();
+        if (frame == null) return;
+        int serial = ++writeSerial;
+        final BluetoothGatt source = gatt;
+        try {
+            characteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE);
+            characteristic.setValue(frame);
+            if (!gatt.writeCharacteristic(characteristic)) {
+                queue.complete();
+                if (!closing) fail("Android odmietol GATT zápis.");
+                else main.postDelayed(this::pump, 50);
+                return;
+            }
+        } catch (RuntimeException e) {
+            queue.complete(); if (!closing) fail("GATT zápis: " + e.getMessage()); return;
+        }
+        writeTimeout = () -> {
+            if (source != gatt || serial != writeSerial || closed) return;
+            // Never pretend an unacknowledged write completed and send another motion frame.
+            Log.i(TAG, hub.label + ": [DBG] write timeout serial=" + serial + " frame=" + hex(frame));
+            if (!closing) fail("GATT zápis bez potvrdenia — bezpečné zatvorenie.");
+        };
+        main.postDelayed(writeTimeout, 2000);
     }
-
-    /** Resume the 20 Hz drive stream with current drive state. */
-    public void resumeStream() {
-        startStream();
+    /** Clears every pending nonzero command without overlapping the active GATT write. */
+    public void emergencyStop() {
+        state.stop();
+        if (closed || closing) return;
+        if (!state.ready) { safeClose(); return; } // abort scan/handshake/calibration too
+        queue.clearPending(); voltagePending = false;
+        enqueue(HubProtocol.drive(0, 0, (lights ? 0 : 4) | 1));
+        for (int port = MOTOR_A; port <= MOTOR_C; port++) enqueue(HubProtocol.motor(port, BRAKE));
+        enqueue(HubProtocol.voltage(false));
     }
-
-    public boolean isClosed() {
-        return closed;
+    private void fail(String reason) {
+        Log.i(TAG, hub.label + ": [DBG] fail: " + reason + " (retryOnce=" + retryOnce + ")");
+        status(reason);
+        if (!retryOnce && (reason.startsWith("CCC") || reason.startsWith("Notifikácie"))) {
+            retryOnce = true;   // transient Android stack state — one silent reconnect (verified 2026-09-16)
+            closeNow();
+            status("Opakujem spojenie (stabilizácia Bluetooth)...");
+            main.postDelayed(this::scanAndConnect, 1200);
+            return;
+        }
+        safeClose();
+    }
+    /** Normal close serializes stop, all brakes and mandatory END before disconnect.
+     * Link loss / broken Android callbacks cannot guarantee physical delivery.
+     */
+    public void safeClose() {
+        if (closing) return;
+        stopScan(); stopStream(); state.setReady(false); phase++; voltagePending = false;
+        if (closed) return;
+        closing = true; queue.clearPending();
+        if (gatt == null) { closeNow(); return; }
+        if (characteristic != null) {
+            enqueue(HubProtocol.drive(0, 0, 5));
+            for (int port = MOTOR_A; port <= MOTOR_C; port++) enqueue(HubProtocol.motor(port, BRAKE));
+            enqueue(HubProtocol.END);
+        }
+        final BluetoothGatt ending = gatt;
+        main.postDelayed(() -> {
+            if (gatt != ending || closed) return;
+            if (!endWritten) {
+                status("Ukončenie bez potvrdenia — skúšam núdzový END; skontrolujte hub.");
+                // Last-resort END only, never motion; stack may reject a stuck write.
+                try {
+                    if (characteristic != null) {
+                        characteristic.setValue(HubProtocol.END);
+                        characteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE);
+                        ending.writeCharacteristic(characteristic);
+                    }
+                } catch (RuntimeException ignored) { }
+            }
+            main.postDelayed(() -> { if (ending == gatt) disconnectTransport(); }, 300);
+        }, 3500);
+        main.postDelayed(() -> { if (ending == gatt) closeNow(); }, 5500);
+    }
+    private void disconnectTransport() {
+        if (gatt == null) return;
+        try { gatt.disconnect(); } catch (RuntimeException e) { closeNow(); }
+    }
+    private void closeNow() {
+        stopScan(); stopStream(); generation++; phase++; state.setReady(false);
+        if (writeTimeout != null) main.removeCallbacks(writeTimeout);
+        if (gatt != null) { try { gatt.close(); } catch (RuntimeException ignored) { } }
+        gatt = null; characteristic = null; descriptorBusy = false; queue.reset();
+        if (receiverRegistered) { try { ctx.unregisterReceiver(bondReceiver); } catch (RuntimeException ignored) { } }
+        receiverRegistered = false; closing = false; closed = true;
+        listener.onDisconnected();
     }
 }

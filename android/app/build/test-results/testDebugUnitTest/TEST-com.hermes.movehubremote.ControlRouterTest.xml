@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.hermes.movehubremote.ControlRouterTest" tests="7" skipped="0" failures="0" errors="0" timestamp="2026-09-16T20:47:04" hostname="dell" time="0.022">
+  <properties/>
+  <testcase name="knownHubsHaveStrictDistinctAddresses" classname="com.hermes.movehubremote.ControlRouterTest" time="0.004"/>
+  <testcase name="protocolOnlyAllowsKnownMotorPortsAndNonzeroSensorDelta" classname="com.hermes.movehubremote.ControlRouterTest" time="0.006"/>
+  <testcase name="disconnectInvalidatesHeldInputAndReconnectStartsAtZero" classname="com.hermes.movehubremote.ControlRouterTest" time="0.003"/>
+  <testcase name="disconnectedHubsRejectMotion" classname="com.hermes.movehubremote.ControlRouterTest" time="0.003"/>
+  <testcase name="safetyQueueDropsPendingMovementButNotInflightWrite" classname="com.hermes.movehubremote.ControlRouterTest" time="0.001"/>
+  <testcase name="releaseClearsMotionBeforeReconnect" classname="com.hermes.movehubremote.ControlRouterTest" time="0.0"/>
+  <testcase name="bothRoutingStopsAndNeverRestoresMotionOnTargetChange" classname="com.hermes.movehubremote.ControlRouterTest" time="0.002"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

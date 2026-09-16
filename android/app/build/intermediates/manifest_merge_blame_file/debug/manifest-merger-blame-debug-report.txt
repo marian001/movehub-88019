@@ -1,0 +1,89 @@
+1<?xml version="1.0" encoding="utf-8"?>
+2<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+3    package="com.hermes.movehubremote"
+4    android:versionCode="4"
+5    android:versionName="0.2" >
+6
+7    <uses-sdk
+8        android:minSdkVersion="23"
+9        android:targetSdkVersion="34" />
+10
+11    <!-- Android 12+ -->
+12    <uses-permission
+12-->/home/alfonz/repos/movehub-88019/android/app/src/main/AndroidManifest.xml:6:5-8:31
+13        android:name="android.permission.BLUETOOTH_SCAN"
+13-->/home/alfonz/repos/movehub-88019/android/app/src/main/AndroidManifest.xml:6:22-70
+14        android:usesPermissionFlags="neverForLocation" />
+14-->/home/alfonz/repos/movehub-88019/android/app/src/main/AndroidManifest.xml:7:9-55
+15    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+15-->/home/alfonz/repos/movehub-88019/android/app/src/main/AndroidManifest.xml:9:5-76
+15-->/home/alfonz/repos/movehub-88019/android/app/src/main/AndroidManifest.xml:9:22-73
+16    <!-- legacy (Android 11 and below) -->
+17    <uses-permission
+17-->/home/alfonz/repos/movehub-88019/android/app/src/main/AndroidManifest.xml:11:5-95
+18        android:name="android.permission.BLUETOOTH"
+18-->/home/alfonz/repos/movehub-88019/android/app/src/main/AndroidManifest.xml:11:22-65
+19        android:maxSdkVersion="30" />
+19-->/home/alfonz/repos/movehub-88019/android/app/src/main/AndroidManifest.xml:11:66-92
+20    <uses-permission
+20-->/home/alfonz/repos/movehub-88019/android/app/src/main/AndroidManifest.xml:12:5-101
+21        android:name="android.permission.BLUETOOTH_ADMIN"
+21-->/home/alfonz/repos/movehub-88019/android/app/src/main/AndroidManifest.xml:12:22-71
+22        android:maxSdkVersion="30" />
+22-->/home/alfonz/repos/movehub-88019/android/app/src/main/AndroidManifest.xml:12:72-98
+23    <uses-permission
+23-->/home/alfonz/repos/movehub-88019/android/app/src/main/AndroidManifest.xml:13:5-106
+24        android:name="android.permission.ACCESS_FINE_LOCATION"
+24-->/home/alfonz/repos/movehub-88019/android/app/src/main/AndroidManifest.xml:13:22-76
+25        android:maxSdkVersion="30" />
+25-->/home/alfonz/repos/movehub-88019/android/app/src/main/AndroidManifest.xml:13:77-103
+26    <uses-permission
+26-->/home/alfonz/repos/movehub-88019/android/app/src/main/AndroidManifest.xml:14:5-108
+27        android:name="android.permission.ACCESS_COARSE_LOCATION"
+27-->/home/alfonz/repos/movehub-88019/android/app/src/main/AndroidManifest.xml:14:22-78
+28        android:maxSdkVersion="30" />
+28-->/home/alfonz/repos/movehub-88019/android/app/src/main/AndroidManifest.xml:14:79-105
+29
+30    <uses-feature
+30-->/home/alfonz/repos/movehub-88019/android/app/src/main/AndroidManifest.xml:16:5-90
+31        android:name="android.hardware.bluetooth_le"
+31-->/home/alfonz/repos/movehub-88019/android/app/src/main/AndroidManifest.xml:16:19-63
+32        android:required="true" />
+32-->/home/alfonz/repos/movehub-88019/android/app/src/main/AndroidManifest.xml:16:64-87
+33
+34    <application
+34-->/home/alfonz/repos/movehub-88019/android/app/src/main/AndroidManifest.xml:18:5-34:19
+35        android:allowBackup="false"
+35-->/home/alfonz/repos/movehub-88019/android/app/src/main/AndroidManifest.xml:20:9-36
+36        android:debuggable="true"
+37        android:extractNativeLibs="false"
+38        android:icon="@android:drawable/ic_menu_manage"
+38-->/home/alfonz/repos/movehub-88019/android/app/src/main/AndroidManifest.xml:21:9-56
+39        android:label="Move Hub Remote" >
+39-->/home/alfonz/repos/movehub-88019/android/app/src/main/AndroidManifest.xml:19:9-40
+40        <activity
+40-->/home/alfonz/repos/movehub-88019/android/app/src/main/AndroidManifest.xml:23:9-33:20
+41            android:name="com.hermes.movehubremote.MainActivity"
+41-->/home/alfonz/repos/movehub-88019/android/app/src/main/AndroidManifest.xml:24:13-41
+42            android:configChanges="orientation|screenSize|keyboardHidden"
+42-->/home/alfonz/repos/movehub-88019/android/app/src/main/AndroidManifest.xml:27:13-74
+43            android:exported="true"
+43-->/home/alfonz/repos/movehub-88019/android/app/src/main/AndroidManifest.xml:25:13-36
+44            android:screenOrientation="portrait"
+44-->/home/alfonz/repos/movehub-88019/android/app/src/main/AndroidManifest.xml:26:13-49
+45            android:theme="@android:style/Theme.Material.Light" >
+45-->/home/alfonz/repos/movehub-88019/android/app/src/main/AndroidManifest.xml:28:13-64
+46            <intent-filter>
+46-->/home/alfonz/repos/movehub-88019/android/app/src/main/AndroidManifest.xml:29:13-32:29
+47                <action android:name="android.intent.action.MAIN" />
+47-->/home/alfonz/repos/movehub-88019/android/app/src/main/AndroidManifest.xml:30:17-69
+47-->/home/alfonz/repos/movehub-88019/android/app/src/main/AndroidManifest.xml:30:25-66
+48
+49                <category android:name="android.intent.category.LAUNCHER" />
+49-->/home/alfonz/repos/movehub-88019/android/app/src/main/AndroidManifest.xml:31:17-77
+49-->/home/alfonz/repos/movehub-88019/android/app/src/main/AndroidManifest.xml:31:27-74
+50            </intent-filter>
+51        </activity>
+52    </application>
+53
+54</manifest>
